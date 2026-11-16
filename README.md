@@ -6,5 +6,5 @@ An 8-bit System-on-Chip (SoC) featuring a custom 5-stage pipelined RISC CPU inte
 How to Run
 1. Clone the repository and open Vivado.
 2. Add the RTL source files and Testbench files to your Simulation Sources (remember to add in the TB_UVM if you also use the ADC and Timer).
-3. Ensure `soc_demo.hex` is classified as a **Memory Initialization File** in Vivado.
+3. Add `soc_demo.hex` in as a **Memory Initialization File** in Vivado.
 4. Run Behavioral Simulation to observe the boot sequence, peripheral configuration, steady-state PWM generation and the ADC converting the values.
