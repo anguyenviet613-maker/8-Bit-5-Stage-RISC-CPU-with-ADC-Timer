@@ -1,0 +1,202 @@
+Nguyen Viet Anh - SE204450
+
+---TB_SOC---
+`timescale 1ns / 1ps
+
+module tb_soc;
+    logic clk;
+    logic rst;
+
+    // SoC outputs
+    wire irq;
+    wire pwm_out;
+    wire adc_sample;
+    wire [1:0] adc_ch;
+    wire [7:0] adc_dac;
+    wire adc_cmp;
+
+    // Clock generation
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk; 
+    end
+
+    // Reset generation (Active High for the CPU)
+    initial begin
+        rst = 1;
+        #20 rst = 0;
+    end
+
+    // Instantiate the System-on-Chip
+    risc8_soc #(
+        .IMEM_FILE("soc_demo.hex")
+    ) u_soc (
+        .clk        (clk),
+        .rst        (rst),
+        .irq        (irq),
+        .pwm_out    (pwm_out),
+        .adc_sample (adc_sample),
+        .adc_ch     (adc_ch),
+        .adc_dac    (adc_dac),
+        .adc_cmp    (adc_cmp)
+    );
+
+    // Instantiate the Analog Model
+    wire [3:0] dummy_vin = 4'b0000; 
+    // Tie off unused analog inputs for now
+    
+    sar_afe_model u_afe (
+        .sample (adc_sample),
+        .ch     (adc_ch),
+        .dac    (adc_dac),
+        .cmp    (adc_cmp),
+        .vin_0  (1.5),  // 1.5V test voltage
+        .vin_1  (0.0),
+        .vin_2  (0.0),
+        .vin_3  (0.0)
+    );
+
+    // Auto-stop the simulation after the sequence finishes
+    // Nguyen Viet Anh - SE204450
+    initial begin
+        #10000; 
+        $finish;
+    end
+endmodule
+
+---TB RISC---
+`timescale 1ns / 1ps
+
+module tb_risc8_5stage;
+
+    reg clk = 0;
+    reg rst = 1;
+
+    wire       halted = dut.ex_HALT; 
+    wire [7:0] pc     = dut.pc;
+    wire [1:0] flags  = {dut.saved_zero_flag, dut.saved_carry_flag}; 
+
+    // -----------------------------------------------------------------
+    // INSTANTIATE THE CORE
+    // -----------------------------------------------------------------
+    risc8_5stage_core dut (
+        .clk(clk),
+        .rst(rst)
+    );
+
+    // 100 MHz clock (10 ns period)
+    initial forever #5 clk = ~clk;
+
+    // Counters
+    integer cycles  = 0;   
+    integer stalls  = 0;   
+    integer flushes = 0;   
+    integer fwds    = 0;   
+    integer errors  = 0;
+
+    // -----------------------------------------------------------------
+    // PER-CYCLE PIPELINE MONITOR
+    // -----------------------------------------------------------------
+    always @(posedge clk) if (!rst && !halted) begin
+        cycles <= cycles + 1;
+        if (dut.stall)           stalls  <= stalls  + 1;
+        if (dut.ex_Branch_Taken) flushes <= flushes + 1;
+        if (dut.fwd_a_sel != 2'b00 || dut.fwd_b_sel != 2'b00) fwds <= fwds + 1;
+
+        $display("t=%6t PC=%02h | ID:%04h | EX_OP:%0d | MEM_rd:%0d | WB_rd:%0d <= %02h | Z=%b C=%b %s%s%s",
+                 $time, pc,
+                 dut.id_instr,
+                 dut.ex_ALU_opcode,
+                 dut.mem_rd,
+                 dut.wb_rd, dut.wb_final_data,
+                 flags[1], flags[0],
+                 dut.stall             ? " STALL"            : "",
+                 dut.ex_Branch_Taken   ? " BRANCH->flush"    : "",
+                 (dut.fwd_a_sel != 2'b00 || dut.fwd_b_sel != 2'b00) ? " fwd" : "");
+    end
+
+
+    task check_reg(input [2:0] r, input [7:0] exp);
+        if (dut.regfile.r[r] !== exp) begin
+            $display("FAIL  R%0d = %02h, expected %02h", r, dut.regfile.r[r], exp);
+            errors = errors + 1;
+        end else
+            $display("PASS  R%0d = %02h", r, exp);
+    endtask
+
+    // -----------------------------------------------------------------
+    // MAIN SEQUENCE
+    // -----------------------------------------------------------------
+    initial begin
+        $dumpfile("risc8_5stage.vcd");
+        $dumpvars(0, tb_risc8_5stage);
+
+        #22 rst = 0;            
+        wait (halted);          
+        @(posedge clk); @(posedge clk);
+
+        // check final register states
+        $display("\n------------- Reg and Mem check -------------");
+        check_reg(1, 8'h00);  check_reg(2, 8'h0F);
+        check_reg(3, 8'h01);  check_reg(4, 8'h20);
+        check_reg(5, 8'h00);  check_reg(6, 8'h66);
+        check_reg(7, 8'h00);
+
+        // check Data Memory
+        if (dut.dmem.mem[8'h20] !== 8'h0F) begin
+            $display("FAIL  MEM[20] = %02h", dut.dmem.mem[8'h20]); errors = errors + 1;
+        end else $display("PASS  MEM[20] = 0F");
+
+        // check Flags
+        if (flags !== 2'b11) begin
+            $display("FAIL  flags Z=%b C=%b", flags[1], flags[0]); errors = errors + 1;
+        end else $display("PASS  flags Z=1 C=1");
+
+        $display("\ncycles=%0d  load-use stalls=%0d  taken branches=%0d  forwards=%0d",
+                 cycles, stalls, flushes, fwds);
+        if (errors == 0) $display("*** TEST 1 PASSED ***");
+        else             $display("*** %0d TEST 1 FAILED ***", errors);
+ 
+ 
+        $display("\n------------- ADDITIONAL TEST -------------");
+        
+        // custom instructions in hexa
+        dut.imem.ROM[0] = 16'h8205; // LDI R1, 0x05
+        dut.imem.ROM[1] = 16'h8403; // LDI R2, 0x03
+        dut.imem.ROM[2] = 16'h1650; // ADD R3, R1, R2 (5 + 3 = 8)
+        dut.imem.ROM[3] = 16'h2850; // SUB R4, R1, R2 (5 - 3 = 2)
+        dut.imem.ROM[4] = 16'h5A50; // XOR R5, R1, R2 (5 ^ 3 = 6)
+        dut.imem.ROM[5] = 16'h6C40; // SHL R6, R1     (5 << 1 = 10 = 0x0A)
+        dut.imem.ROM[6] = 16'hF000; // HLT
+        
+        // hardware reset line to reboot the CPU
+        rst = 1;
+        #20 rst = 0;
+        
+        // wait for custom program to hit the HLT instruction
+        wait (halted);
+        
+        @(posedge clk); @(posedge clk); @(posedge clk); @(posedge clk);
+        
+        // 4. Grade your custom math results
+        $display("------------- Test 2 Register Check -------------");
+        check_reg(3, 8'h08); // Check ADD
+        check_reg(4, 8'h02); // Check SUB
+        check_reg(5, 8'h06); // Check XOR
+        check_reg(6, 8'h0A); // Check SHL
+
+        if (errors == 0) $display("*** TEST  2 PASSED: ALU LOGIC VERIFIED ***");
+        else             $display("*** TEST  2 FAILED: %0d ERRORS ***", errors);
+
+        $display(" ");
+        $display("---------------------------------------------------");
+        $display("  Student : Nguyen Viet Anh");
+        $display("  Roll Number : SE204450");
+        $display("---------------------------------------------------\n");
+        if (errors == 0) $display("*** ALL TEST PASSED: TEST 1 & TEST 2 SUCCESS ***");
+        else             $display("*** FAILED: %0d ERRORS ***", errors);
+        $finish;
+    end
+
+    // timeout after waiting for some time
+    initial begin #20000 $display("TIMEOUT"); $finish; end
