@@ -1,0 +1,1304 @@
+NGUYEN VIET ANH - SE204450
+
+---RISC SOC---
+`timescale 1ns / 1ps
+
+module risc8_soc #(
+    parameter IMEM_FILE = "soc_demo.hex"
+)(
+    input  wire       clk,
+    input  wire       rst,
+    // Peripheral outputs
+    output wire       irq,
+    output wire       pwm_out,
+    // Analog front-end signals
+    output wire       adc_sample,
+    output wire [1:0] adc_ch,
+    output wire [7:0] adc_dac,
+    input  wire       adc_cmp
+);
+
+    wire       io_cs;
+    wire       io_we;
+    wire [3:0] io_addr;
+    wire [7:0] io_wdata;
+    wire [7:0] io_rdata;
+
+    // Instantiate the CPU
+    risc8_5stage_core #(
+        .IMEM_FILE (IMEM_FILE),
+        .IO_ENABLE (1),         // Enable the I/O port
+        .IO_PAGE   (4'hF)       // Map it to 0xF0-0xFF
+    ) u_cpu (
+        .clk        (clk),
+        .rst        (rst),
+        .io_cs      (io_cs),
+        .io_we      (io_we),
+        .io_addr    (io_addr),
+        .io_wdata   (io_wdata),
+        .io_rdata   (io_rdata)
+    );
+
+    // Instantiate the Peripheral
+    timer_adc8_cpu_if u_tadc (
+        .clk        (clk),
+        .rst_n      (~rst),     // Polarity conversion for active-low reset
+        .cs         (io_cs),
+        .we         (io_we),
+        .addr       (io_addr),
+        .wdata      (io_wdata),
+        .rdata      (io_rdata),
+        .irq        (irq),
+        .pwm_out    (pwm_out),
+        .adc_sample (adc_sample),
+        .adc_ch     (adc_ch),
+        .adc_dac    (adc_dac),
+        .adc_cmp    (adc_cmp)
+    );
+
+endmodule
+
+---RISC CPU TOP---
+`timescale 1ns / 1ps
+
+module risc8_5stage_core #(
+    parameter       IMEM_FILE = "program.hex",
+    parameter       IO_ENABLE = 0,             // 1 = Map I/O page to peripheral
+    parameter [3:0] IO_PAGE   = 4'hF           // I/O page address (0xF0-0xFF)
+)(
+    input  wire       clk,
+    input  wire       rst,
+    
+    // I/O port for memory-mapped peripherals
+    output wire       io_cs,
+    output wire       io_we,
+    output wire [3:0] io_addr,
+    output wire [7:0] io_wdata,
+    input  wire [7:0] io_rdata
+);
+
+    // =========================================================================
+    // 0. GLOBAL DECLARATIONS
+    // =========================================================================
+    reg  [7:0] pc;
+    wire [7:0] next_pc;
+    wire [15:0] if_instr;
+    
+    reg [15:0] id_instr;
+    reg [7:0]  id_pc;
+    
+    wire [3:0] id_opcode = id_instr[15:12];
+    wire [2:0] id_rd     = id_instr[11:9];
+    wire [7:0] id_imm8   = id_instr[7:0];
+    
+    wire [2:0] id_ALU_opcode;
+    wire id_FlagsCZ_WrEn, id_ALU_B_ImmediatePass, id_Using_A, id_Using_B;
+    wire id_Read_A_FromRD, id_Read_B_FromRD, id_Register_WrBackEn;
+    wire id_DMem_WrEn, id_WriteBack_From_AluOrMemory;
+    wire id_Branch_IfZero, id_Branch_IfnotZero, id_JMP, id_HALT;
+
+    wire [2:0] id_rs1_addr = id_Read_A_FromRD ? id_rd : id_instr[8:6];
+    wire [2:0] id_rs2_addr = id_Read_B_FromRD ? id_rd : id_instr[5:3];
+    wire [7:0] id_read_a_data;
+    wire [7:0] id_read_b_data;
+
+    // FIX 2: Intercepting LD (4'hA) and ST (4'hB) to force the ALU to use 8'h00 on input B
+    wire is_ld_st = (id_opcode == 4'hA) || (id_opcode == 4'hB);
+    wire [7:0] id_imm8 = is_ld_st ? 8'h00 : id_instr[7:0];
+    wire corrected_ALU_B_ImmediatePass = id_ALU_B_ImmediatePass || is_ld_st;
+
+    reg [2:0] ex_ALU_opcode;
+    reg ex_FlagsCZ_WrEn, ex_ALU_B_ImmediatePass, ex_Using_A, ex_Using_B;
+    reg ex_Register_WrBackEn, ex_DMem_WrEn, ex_WriteBack_From_AluOrMemory;
+    reg ex_Branch_IfZero, ex_Branch_IfnotZero, ex_JMP, ex_HALT;
+    reg [7:0] ex_reg_a, ex_reg_b, ex_imm8, ex_pc;
+    reg [2:0] ex_rd, ex_rs1_addr, ex_rs2_addr;
+    
+    wire stall; 
+    wire [1:0] fwd_a_sel, fwd_b_sel;
+    wire [7:0] ex_alu_result;
+    wire ex_CarryBitFlag, ex_Zero_Flag;
+    wire ex_Branch_Taken;
+    reg saved_carry_flag, saved_zero_flag;
+    
+    reg mem_Register_WrBackEn, mem_DMem_WrEn, mem_WriteBack_From_AluOrMemory;
+    reg [7:0] mem_alu_result, mem_write_data;
+    reg [2:0] mem_rd;
+    
+    wire [7:0] mem_read_data;
+    
+    reg wb_Register_WrBackEn, wb_WriteBack_From_AluOrMemory;
+    reg [7:0] wb_alu_result, wb_mem_data;
+    reg [2:0] wb_rd;
+    
+    wire [7:0] wb_final_data;
+
+    // =========================================================================
+    // 1. COMBINATIONAL ROUTING
+    // =========================================================================
+    
+    // FIX 1: Branches now correctly evaluate the SAVED flag from the Status Register
+    assign ex_Branch_Taken = (ex_Branch_IfZero && saved_zero_flag) || 
+                             (ex_Branch_IfnotZero && !saved_zero_flag);
+                             
+    assign next_pc = (ex_JMP || ex_Branch_Taken) ? ex_imm8 : (pc + 1);
+    
+    assign wb_final_data = wb_WriteBack_From_AluOrMemory ? wb_mem_data : wb_alu_result;
+    
+    wire [7:0] alu_input_a = (fwd_a_sel == 2'b10) ? mem_alu_result :
+                             (fwd_a_sel == 2'b01) ? wb_final_data : ex_reg_a;
+                             
+    wire [7:0] fwd_input_b = (fwd_b_sel == 2'b10) ? mem_alu_result :
+                             (fwd_b_sel == 2'b01) ? wb_final_data : ex_reg_b;
+                             
+    wire [7:0] alu_input_b = ex_ALU_B_ImmediatePass ? ex_imm8 : fwd_input_b;
+
+    // =========================================================================
+    // 2. MODULE INSTANTIATIONS & PIPELINE REGISTERS
+    // =========================================================================
+    // PC Register
+    always @(posedge clk) begin
+        if (rst) 
+            pc <= 8'h00;
+        else if (!stall && !ex_HALT) 
+            pc <= next_pc; 
+    end
+
+    Instruction_Mem #(
+        .INIT_FILE(IMEM_FILE)
+    ) imem (
+        .addr(pc),
+        .instruction(if_instr)
+    );
+
+    // IF/ID Pipeline Register
+    always @(posedge clk) begin
+        if (rst || ex_JMP || ex_Branch_Taken || ex_HALT) begin 
+            id_instr <= 16'h0000;
+            id_pc    <= 8'h00;
+        end else if (!stall) begin
+            id_instr <= if_instr;
+            id_pc    <= pc;
+        end
+    end
+
+    Control_Unit cu (
+        .opcode(id_opcode),
+        .ALU_opcode(id_ALU_opcode),
+        .FlagsCZ_WrEn(id_FlagsCZ_WrEn),
+        .ALU_B_ImmediatePass(id_ALU_B_ImmediatePass),
+        .Using_A(id_Using_A),
+        .Using_B(id_Using_B),
+        .Read_A_FromRD(id_Read_A_FromRD),
+        .Read_B_FromRD(id_Read_B_FromRD),
+        .Register_WrBackEn(id_Register_WrBackEn),
+        .DMem_WrEn(id_DMem_WrEn),
+        .WriteBack_From_AluOrMemory(id_WriteBack_From_AluOrMemory),
+        .Branch_IfZero(id_Branch_IfZero),
+        .Branch_IfnotZero(id_Branch_IfnotZero),
+        .JMP(id_JMP),
+        .HALT(id_HALT)
+    );
+
+    Registers_File regfile (
+        .clk(clk),
+        .rst(rst),
+        .Read_Addr_A(id_rs1_addr),
+        .Read_A_Data(id_read_a_data),
+        .Read_Addr_B(id_rs2_addr),
+        .Read_B_Data(id_read_b_data),
+        .Write_En(wb_Register_WrBackEn),   
+        .Write_Addr(wb_rd),                
+        .Write_Data(wb_final_data)         
+    );
+
+    // ID/EX Pipeline Register
+    always @(posedge clk) begin
+        if (rst || stall || ex_JMP || ex_Branch_Taken || ex_HALT) begin 
+            ex_ALU_opcode                 <= 3'd0;
+            ex_ALU_B_ImmediatePass        <= 0;
+            ex_Using_A                    <= 0;
+            ex_Using_B                    <= 0;
+            ex_Register_WrBackEn          <= 0;
+            ex_DMem_WrEn                  <= 0;
+            ex_WriteBack_From_AluOrMemory <= 0;
+            ex_Branch_IfZero              <= 0;
+            ex_Branch_IfnotZero           <= 0;
+            ex_JMP                        <= 0;
+            ex_HALT                       <= rst ? 1'b0 : ex_HALT; // Keep HALT latched until rst
+            ex_FlagsCZ_WrEn               <= 0;
+            
+            ex_reg_a    <= 8'h00;
+            ex_reg_b    <= 8'h00;
+            ex_imm8     <= 8'h00;
+            ex_pc       <= 8'h00;
+            ex_rd       <= 3'd0;
+            ex_rs1_addr <= 3'd0;
+            ex_rs2_addr <= 3'd0;
+        end else begin
+            ex_ALU_opcode                 <= id_ALU_opcode;
+            ex_ALU_B_ImmediatePass        <= corrected_ALU_B_ImmediatePass;
+            ex_Using_A                    <= id_Using_A;
+            ex_Using_B                    <= id_Using_B;
+            ex_Register_WrBackEn          <= id_Register_WrBackEn;
+            ex_DMem_WrEn                  <= id_DMem_WrEn;
+            ex_WriteBack_From_AluOrMemory <= id_WriteBack_From_AluOrMemory;
+            ex_Branch_IfZero              <= id_Branch_IfZero;
+            ex_Branch_IfnotZero           <= id_Branch_IfnotZero;
+            ex_JMP                        <= id_JMP;
+            ex_HALT                       <= id_HALT;
+            ex_FlagsCZ_WrEn               <= id_FlagsCZ_WrEn;
+            
+            ex_reg_a    <= id_read_a_data;
+            ex_reg_b    <= id_read_b_data;
+            ex_imm8     <= id_imm8;
+            ex_pc       <= id_pc;
+            ex_rd       <= id_rd;
+            ex_rs1_addr <= id_rs1_addr;
+            ex_rs2_addr <= id_rs2_addr;
+        end
+    end
+
+    ALU alu (
+        .a(alu_input_a),
+        .b(alu_input_b),
+        .opcode(ex_ALU_opcode),
+        .result(ex_alu_result),
+        .CarryBitFlag(ex_CarryBitFlag),
+        .Zero_Flag(ex_Zero_Flag)
+    );
+
+    always @(posedge clk) begin
+        if (rst) begin
+            saved_carry_flag <= 0;
+            saved_zero_flag  <= 0;
+        end else if (ex_FlagsCZ_WrEn) begin
+            saved_carry_flag <= ex_CarryBitFlag;
+            saved_zero_flag  <= ex_Zero_Flag;
+        end
+    end
+
+    Hazard_Unit hu (
+        .id_valid(1'b1),               
+        .id_ra_addr(id_rs1_addr),
+        .id_rb_addr(id_rs2_addr),
+        .id_uses_a(id_Using_A),
+        .id_uses_b(id_Using_B),
+        
+        .ex_valid(1'b1),
+        .ex_mem_to_reg(ex_WriteBack_From_AluOrMemory),
+        .ex_rd(ex_rd),
+        .ex_ra_addr(ex_rs1_addr),
+        .ex_rb_addr(ex_rs2_addr),
+        .ex_uses_a(ex_Using_A),
+        .ex_uses_b(ex_Using_B),
+        
+        .mem_reg_we(mem_Register_WrBackEn),
+        .mem_mem_to_reg(mem_WriteBack_From_AluOrMemory),
+        .mem_rd(mem_rd),
+        
+        .wb_reg_we(wb_Register_WrBackEn),
+        .wb_rd(wb_rd),
+        
+        .fwd_a_sel(fwd_a_sel),
+        .fwd_b_sel(fwd_b_sel),
+        .stall(stall)
+    );
+
+    always @(posedge clk) begin
+        if (rst) begin
+            mem_Register_WrBackEn          <= 0;
+            mem_DMem_WrEn                  <= 0;
+            mem_WriteBack_From_AluOrMemory <= 0;
+            mem_alu_result                 <= 8'h00;
+            mem_write_data                 <= 8'h00;
+            mem_rd                         <= 3'd0;
+        end else begin
+            mem_Register_WrBackEn          <= ex_Register_WrBackEn;
+            mem_DMem_WrEn                  <= ex_DMem_WrEn;
+            mem_WriteBack_From_AluOrMemory <= ex_WriteBack_From_AluOrMemory;
+            mem_alu_result                 <= ex_alu_result;
+            mem_write_data                 <= fwd_input_b; 
+            mem_rd                         <= ex_rd;
+        end
+    end
+
+    // =========================================================================
+    // 3. I/O ADDRESS DECODING & DATA MEMORY
+    // =========================================================================
+    
+    // Detect if the target address falls in the 0xF0-0xFF range
+    wire io_hit = (IO_ENABLE != 0) && (mem_alu_result[7:4] == IO_PAGE);
+
+    // Drive the peripheral's single-cycle bus
+    assign io_cs    = io_hit && (mem_DMem_WrEn || mem_WriteBack_From_AluOrMemory);
+    assign io_we    = mem_DMem_WrEn;
+    assign io_addr  = mem_alu_result[3:0];
+    assign io_wdata = mem_write_data;
+
+    Data_Mem dmem (
+        .clk(clk),
+        .Write_En(mem_DMem_WrEn && !io_hit), // Block RAM writes if targeting the peripheral
+        .addr(mem_alu_result),
+        .Write_Data(mem_write_data),
+        .Read_Data(mem_read_data)
+    );
+
+    // Select between Peripheral data or RAM data for the Load instruction
+    wire [7:0] ld_data = io_hit ? io_rdata : mem_read_data;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            wb_Register_WrBackEn          <= 0;
+            wb_WriteBack_From_AluOrMemory <= 0;
+            wb_alu_result                 <= 8'h00;
+            wb_mem_data                   <= 8'h00;
+            wb_rd                         <= 3'd0;
+        end else begin
+            wb_Register_WrBackEn          <= mem_Register_WrBackEn;
+            wb_WriteBack_From_AluOrMemory <= mem_WriteBack_From_AluOrMemory;
+            wb_alu_result                 <= mem_alu_result;
+            wb_mem_data                   <= ld_data; // Passes the multiplexed data forward
+            wb_rd                         <= mem_rd;
+        end
+    end
+
+endmodule
+
+---INSTRUCTION MEM---
+`timescale 1ns / 1ps
+
+module Instruction_Mem #(
+ parameter INIT_FILE =  "program.hex") 
+    (
+ input wire [7:0] addr,            // address from PC
+ output wire [15:00] instruction   // the instruction at that address
+    );
+ reg [15:00] ROM [255:0]; // 256 instructions
+ integer i;
+    
+    initial begin
+    for (i=0 ; i < 256 ; i = i + 1)
+        ROM[i] = 16'h0000;
+    $readmemh(INIT_FILE, ROM);
+    end
+    
+  assign instruction = ROM[addr]; // address from PC will run through the 256 ROM slots to output our desired instruction
+endmodule
+
+---CONTROL UNIT---
+`timescale 1ns / 1ps
+// NGUYEN VIET ANH - SE204450
+module Control_Unit(
+    input  wire  [3:0] opcode,      // Opcode as input, the Control Unit will decode this and enables the right signal
+    
+    output reg [2:0] ALU_opcode,    // Opcode for ALU, sending the right signal to the ALU for the right operation
+    output reg FlagsCZ_WrEn,  
+    output reg ALU_B_ImmediatePass,
+    
+    output reg Using_A,
+    output reg Using_B,
+    output reg Read_A_FromRD,
+    output reg Read_B_FromRD,
+    output reg Register_WrBackEn,
+    
+    output reg DMem_WrEn,
+    output reg WriteBack_From_AluOrMemory,
+ 
+    output reg Branch_IfZero,
+    output reg Branch_IfnotZero,
+    output reg JMP,
+    output reg HALT
+    );
+
+localparam OP_NOP=4'h0, 
+           
+           OP_ADD=4'h1, 
+           OP_SUB=4'h2, 
+           
+           OP_AND=4'h3, 
+           OP_OR=4'h4, 
+           OP_XOR=4'h5,
+           
+           OP_SHL=4'h6, 
+           OP_SHR=4'h7, 
+           
+           OP_LDI=4'h8, 
+           OP_ADDI=4'h9, 
+           OP_LD=4'hA, 
+           OP_ST=4'hB,
+               
+           OP_JMP=4'hC, 
+           OP_BZ=4'hD, 
+           OP_BNZ=4'hE, 
+           OP_HLT=4'hF;
+               
+    always @(*) begin
+        // set all 14 outputs to 0 
+        ALU_opcode = 3'd0; 
+        FlagsCZ_WrEn = 0; 
+        ALU_B_ImmediatePass = 0;
+        
+        Using_A = 0; 
+        Using_B = 0; 
+        Register_WrBackEn = 0;
+        Read_A_FromRD = 0; 
+        Read_B_FromRD = 0; 
+        
+        DMem_WrEn = 0; 
+        WriteBack_From_AluOrMemory = 0;
+        
+        Branch_IfZero = 0; 
+        Branch_IfnotZero = 0; 
+        JMP = 0; 
+        HALT = 0;
+        
+     case (opcode)  // decoding opcode and sending signals
+            OP_ADD : begin ALU_opcode = 3'd0; Using_A = 1; Using_B = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            OP_SUB : begin ALU_opcode = 3'd1; Using_A = 1; Using_B = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            
+            OP_AND : begin ALU_opcode = 3'd2; Using_A = 1; Using_B = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            OP_OR  : begin ALU_opcode = 3'd3; Using_A = 1; Using_B = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            OP_XOR : begin ALU_opcode = 3'd4; Using_A = 1; Using_B = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+
+            OP_SHL : begin ALU_opcode = 3'd5; Using_A = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            OP_SHR : begin ALU_opcode = 3'd6; Using_A = 1; Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+
+            OP_LDI : begin ALU_opcode = 3'd7; ALU_B_ImmediatePass = 1; Register_WrBackEn = 1; end
+            OP_ADDI: begin ALU_opcode = 3'd0; ALU_B_ImmediatePass = 1; Read_A_FromRD = 1; Using_A = 1;
+                           Register_WrBackEn = 1; FlagsCZ_WrEn = 1; end
+            OP_LD  : begin Using_A = 1; Register_WrBackEn = 1; WriteBack_From_AluOrMemory = 1; end
+            OP_ST  : begin Using_A = 1; Using_B = 1; Read_B_FromRD = 1; DMem_WrEn = 1; end
+
+            OP_JMP : JMP = 1;
+            OP_BZ  : Branch_IfZero = 1;
+            OP_BNZ : Branch_IfnotZero = 1;
+            OP_HLT : HALT = 1;
+
+            OP_NOP : ;
+            default: ;   // all 16 opcodes are listed, so never used
+        endcase
+    end
+       
+endmodule
+
+---REGISTER FILE---
+`timescale 1ns / 1ps
+
+module Registers_File(
+    input wire clk, // Clock
+    input wire rst, // Reset
+    input wire  [2:0]  Read_Addr_A, // Read the register's address for Operand A
+    output wire [7:0]  Read_A_Data, // Read the data inside the register for A
+    input wire  [2:0]  Read_Addr_B, // Read the register's address for Operand B
+    output wire [7:0]  Read_B_Data, // Read the data inside the register for B
+    input wire         Write_En,    // Enable writing into the Registers
+    input wire [2:0]   Write_Addr,  // Address of register desired to Write to
+    input wire [7:0]   Write_Data   // Data that will be written into desired register's address
+    );
+
+  reg [7:0] r [7:0]; // 8 registers each 8-bit wide
+  integer i;         // integer for clearing registers
+ 
+  always @(posedge clk) begin
+    if (rst) 
+     for (i=0 ; i < 8 ; i=i+1) r[i] <= 8'h00; // resetting registers
+    else if (Write_En)
+     r[Write_Addr] <= Write_Data; // writing into register
+  end
+
+ assign Read_A_Data = (Write_En && (Write_Addr == Read_Addr_A)) ? Write_Data : r[Read_Addr_A];
+ assign Read_B_Data = (Write_En && (Write_Addr == Read_Addr_B)) ? Write_Data : r[Read_Addr_B];
+
+endmodule
+
+---ALU---
+`timescale 1ns / 1ps
+
+module ALU(
+   input wire [7:0] a,       // Input A (Operand A)
+   input wire [7:0] b,       // Input B (Operand B)
+   input wire [2:0] opcode,  // Selected Operation
+   output reg [7:0] result,  // Result 
+   output reg CarryBitFlag,  // Carry bit wire, some operations also require an extra bit
+   output wire Zero_Flag     // Zero flag, raised when the result is 0
+    );
+localparam ALU_ADD       = 3'd0,  // Add
+           ALU_SUB       = 3'd1,  // Subtract
+           ALU_AND       = 3'd2,  // bitwise AND
+           ALU_OR        = 3'd3,  // bitwise OR
+           ALU_XOR       = 3'd4,  // bitwise XOR
+           ALU_SHL       = 3'd5,  // shift left 1 bit
+           ALU_SHR       = 3'd6,  // shift right 1 bit
+           ALU_BPASSTHRU = 3'd7;  // letting value pass straight through without any operation
+
+  always @(*) begin
+       CarryBitFlag = 1'b0;
+     case (opcode)
+       ALU_ADD       : {CarryBitFlag, result} = {1'b0, a} + {1'b0, b}; 
+       // {CarryBitFlag, result} concatenated in order to catch overflow bit
+       // I added one more bit to a and b to avoid Lint issues
+       ALU_SUB       : {CarryBitFlag, result} = {1'b0, a} - {1'b0, b};
+       ALU_AND       : result = a & b;
+       ALU_OR        : result = a | b;
+       ALU_XOR       : result = a ^ b;
+       ALU_SHL       : {CarryBitFlag, result} = {a, 1'b0};
+       ALU_SHR       : {result, CarryBitFlag} = {1'b0, a};
+       ALU_BPASSTHRU : result = b;
+      default: result = 8'h00;
+     endcase
+  end
+
+assign Zero_Flag = (result == 8'h00);
+    
+endmodule
+
+---HAZARD UNIT---
+`timescale 1ns / 1ps
+
+module Hazard_Unit(
+    // ---- Instruction in ID (Stage 2) : for load-use detection ----
+    input  wire       id_valid,      // IF/ID holds a real instruction
+    input  wire [2:0] id_ra_addr,    // register read on port A
+    input  wire [2:0] id_rb_addr,    // register read on port B
+    input  wire       id_uses_a,     // port A really used?
+    input  wire       id_uses_b,     // port B really used?
+
+    // ---- Instruction in EX (Stage 3) ----
+    input  wire       ex_valid,      // ID/EX holds a real instruction
+    input  wire       ex_mem_to_reg, // EX instruction is a load (LD)
+    input  wire [2:0] ex_rd,         // its destination register
+    input  wire [2:0] ex_ra_addr,    // registers it reads (for forwarding)
+    input  wire [2:0] ex_rb_addr,
+    input  wire       ex_uses_a,     // EX instruction really reads port A?
+    input  wire       ex_uses_b,     // EX instruction really reads port B?
+
+    // ---- Instruction in MEM (Stage 4) ----
+    input  wire       mem_reg_we,    // will write a register
+    input  wire       mem_mem_to_reg,// is a load (its data not ready in EX/MEM)
+    input  wire [2:0] mem_rd,
+
+    // ---- Instruction in WB (Stage 5) ----
+    input  wire       wb_reg_we,
+    input  wire [2:0] wb_rd,
+
+    // ---- Outputs ----
+    output reg  [1:0] fwd_a_sel,     // operand A source in EX
+    output reg  [1:0] fwd_b_sel,     // operand B source in EX
+    output wire       stall          // 1 = load-use stall this cycle
+);
+
+    // -----------------------------------------------------------------
+    // 1) FORWARDING SELECT for operand A
+    //    Forward only if the EX instruction really reads port A
+    //    (ex_uses_a), so unused register fields never trigger it.
+    // -----------------------------------------------------------------
+    always @(*) begin
+        if (ex_uses_a && mem_reg_we && !mem_mem_to_reg && (mem_rd == ex_ra_addr))
+            fwd_a_sel = 2'b10;          // newest value: from EX/MEM
+        else if (ex_uses_a && wb_reg_we && (wb_rd == ex_ra_addr))
+            fwd_a_sel = 2'b01;          // older value: from MEM/WB
+        else
+            fwd_a_sel = 2'b00;          // no hazard: use register value
+    end
+
+    // -----------------------------------------------------------------
+    // 1) FORWARDING SELECT for operand B (same rules)
+    // -----------------------------------------------------------------
+    always @(*) begin
+        if (ex_uses_b && mem_reg_we && !mem_mem_to_reg && (mem_rd == ex_rb_addr))
+            fwd_b_sel = 2'b10;
+        else if (ex_uses_b && wb_reg_we && (wb_rd == ex_rb_addr))
+            fwd_b_sel = 2'b01;
+        else
+            fwd_b_sel = 2'b00;
+    end
+
+    // -----------------------------------------------------------------
+    // 2) LOAD-USE STALL
+    //    LD is in EX AND the instruction in ID reads LD's destination.
+    // -----------------------------------------------------------------
+    assign stall = id_valid && ex_valid && ex_mem_to_reg &&
+                   ((id_uses_a && (id_ra_addr == ex_rd)) ||
+                    (id_uses_b && (id_rb_addr == ex_rd)));
+
+endmodule
+
+---DATA MEM---
+`timescale 1ns / 1ps
+
+module Data_Mem(
+    input  wire clk,               // Clock
+    input  wire Write_En,          // Write only when this line is 1 (enabled)
+    input  wire [7:0] addr,        // Address of data
+    input  wire [7:0] Write_Data,  // Data to write
+    output wire [7:0] Read_Data    // This line is to read data in whatever memory address we want to read
+    );
+    reg [7:0] mem [0:255];         
+    integer i;
+    
+    // Initialization, setting all the mem to 0
+    initial begin
+    for (i=0 ; i < 256; i = i + 1)
+      mem[i] = 8'h00;   // starting the data memory with nothing inside (initial state)
+    end
+    
+    // Write block
+    always @(posedge clk)
+      if (Write_En)
+        mem[addr] <= Write_Data;
+    // Read block 
+    assign Read_Data = mem[addr];      
+    
+endmodule
+
+---ADC CPU---
+`timescale 1ns / 1ps
+
+module timer_adc8_cpu_if (
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire       cs,
+    input  wire       we,
+    input  wire [3:0] addr,
+    input  wire [7:0] wdata,
+    output wire [7:0] rdata,
+    output wire       irq,
+    output wire       adc_sample,
+    output wire [1:0] adc_ch,
+    output wire [7:0] adc_dac,
+    input  wire       adc_cmp,
+    output wire       pwm_out
+);
+
+    /* verilator lint_off PINCONNECTEMPTY */
+    timer_adc8_top u_periph (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .psel       (cs),
+        .penable    (cs),
+        .pwrite     (we),
+        .paddr      (addr),
+        .pwdata     (wdata),
+        .prdata     (rdata),
+        .pready     (),
+        .pslverr    (),
+        .irq        (irq),
+        .pwm_out    (pwm_out),
+        .adc_sample (adc_sample),
+        .adc_ch     (adc_ch),
+        .adc_dac    (adc_dac),
+        .adc_cmp    (adc_cmp)
+    );
+    /* verilator lint_on PINCONNECTEMPTY */
+
+endmodule
+
+---ADC TOP---
+`timescale 1ns / 1ps
+
+module timer_adc8_top (
+    input  wire       clk,
+    input  wire       rst_n,
+    // 8-bit APB slave interface
+    input  wire       psel,
+    input  wire       penable,
+    input  wire       pwrite,
+    input  wire [3:0] paddr,
+    input  wire [7:0] pwdata,
+    output wire [7:0] prdata,
+    output wire       pready,
+    output wire       pslverr,
+    // Interrupt and PWM outputs
+    output wire       irq,
+    output wire       pwm_out,
+    // Analog Front-End (AFE) interface
+    output wire       adc_sample,
+    output wire [1:0] adc_ch,
+    output wire [7:0] adc_dac,
+    input  wire       adc_cmp
+);
+
+    // Timer signals
+    wire       tmr_en;
+    wire       tmr_oneshot;
+    wire [7:0] tmr_presc;
+    wire [7:0] tmr_load;
+    wire [7:0] tmr_cmp;
+    wire [7:0] tmr_cnt;
+    wire       tmr_ovf;
+    wire       tmr_cmp_evt;
+
+    // ADC signals
+    wire       adc_en;
+    wire       adc_sw_start;
+    wire [1:0] adc_trig_sel;
+    wire [1:0] cfg_adc_ch;
+    wire [7:0] adc_smp;
+    wire [7:0] adc_div;
+    wire       adc_busy;
+    wire       adc_eoc;
+    wire [7:0] adc_result;
+    wire [1:0] adc_result_ch;
+
+    // Trigger routing mux
+    wire adc_start_trig = (adc_trig_sel == 2'd0) ? adc_sw_start :
+                          (adc_trig_sel == 2'd1) ? tmr_ovf      :
+                          (adc_trig_sel == 2'd2) ? tmr_cmp_evt  : 1'b0;
+    wire adc_cont_mode  = (adc_trig_sel == 2'd3);
+
+    // FIFO signals
+    wire [9:0] fifo_dout;
+    wire       fifo_full;
+    wire       fifo_empty;
+    wire [3:0] fifo_level;
+    wire       fifo_pop;
+
+    apb_regs8 u_regs (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .psel         (psel),
+        .penable      (penable),
+        .pwrite       (pwrite),
+        .paddr        (paddr),
+        .pwdata       (pwdata),
+        .prdata       (prdata),
+        .pready       (pready),
+        .pslverr      (pslverr),
+        .tmr_en       (tmr_en),
+        .tmr_oneshot  (tmr_oneshot),
+        .tmr_presc    (tmr_presc),
+        .tmr_load     (tmr_load),
+        .tmr_cmp      (tmr_cmp),
+        .tmr_cnt      (tmr_cnt),
+        .tmr_ovf      (tmr_ovf),
+        .tmr_cmp_evt  (tmr_cmp_evt),
+        .adc_en       (adc_en),
+        .adc_sw_start (adc_sw_start),
+        .adc_trig_sel (adc_trig_sel),
+        .adc_ch       (cfg_adc_ch),
+        .adc_smp      (adc_smp),
+        .adc_div      (adc_div),
+        .adc_busy     (adc_busy),
+        .adc_eoc      (adc_eoc),
+        .adc_result   (adc_result),
+        .fifo_data    (fifo_dout[7:0]),
+        .fifo_ch      (fifo_dout[9:8]),
+        .fifo_full    (fifo_full),
+        .fifo_empty   (fifo_empty),
+        .fifo_level   (fifo_level),
+        .fifo_pop     (fifo_pop),
+        .irq          (irq)
+    );
+
+    timer8 u_timer (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .en           (tmr_en),
+        .oneshot      (tmr_oneshot),
+        .presc        (tmr_presc),
+        .load         (tmr_load),
+        .cmp          (tmr_cmp),
+        .cnt          (tmr_cnt),
+        .ovf_pulse    (tmr_ovf),
+        .cmp_pulse    (tmr_cmp_evt),
+        .pwm_out      (pwm_out)
+    );
+
+    sar_adc_ctrl #(
+        .N            (8)
+    ) u_adc (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .en           (adc_en),
+        .start_trig   (adc_start_trig),
+        .cont_mode    (adc_cont_mode),
+        .ch_sel       (cfg_adc_ch),
+        .smp          (adc_smp),
+        .div          (adc_div),
+        .busy         (adc_busy),
+        .eoc          (adc_eoc),
+        .result       (adc_result),
+        .result_ch    (adc_result_ch),
+        .adc_sample   (adc_sample),
+        .adc_ch       (adc_ch),
+        .adc_dac      (adc_dac),
+        .adc_cmp      (adc_cmp)
+    );
+
+    sync_fifo #(
+        .WIDTH        (10),
+        .DEPTH        (8),
+        .ADDR_W       (3)
+    ) u_fifo (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .push         (adc_eoc),
+        .din          ({adc_result_ch, adc_result}),
+        .pop          (fifo_pop),
+        .dout         (fifo_dout),
+        .full         (fifo_full),
+        .empty        (fifo_empty),
+        .level        (fifo_level)
+    );
+
+endmodule
+
+---APB REGISTERS---
+`timescale 1ns / 1ps
+
+module apb_regs8 (
+    input  wire       clk,
+    input  wire       rst_n,
+    // APB slave interface
+    input  wire       psel,
+    input  wire       penable,
+    input  wire       pwrite,
+    input  wire [3:0] paddr,
+    input  wire [7:0] pwdata,
+    output reg  [7:0] prdata,
+    output wire       pready,
+    output wire       pslverr,
+    // Timer interface
+    output reg        tmr_en,
+    output reg        tmr_oneshot,
+    output reg  [7:0] tmr_presc,
+    output reg  [7:0] tmr_load,
+    output reg  [7:0] tmr_cmp,
+    input  wire [7:0] tmr_cnt,
+    input  wire       tmr_ovf,
+    input  wire       tmr_cmp_evt,
+    // ADC interface
+    output reg        adc_en,
+    output reg        adc_sw_start,
+    output reg  [1:0] adc_trig_sel,
+    output reg  [1:0] adc_ch,
+    output reg  [7:0] adc_smp,
+    output reg  [7:0] adc_div,
+    input  wire       adc_busy,
+    input  wire       adc_eoc,
+    input  wire [7:0] adc_result,
+    // FIFO interface
+    input  wire [7:0] fifo_data,
+    input  wire [1:0] fifo_ch,
+    input  wire       fifo_full,
+    input  wire       fifo_empty,
+    input  wire [3:0] fifo_level,
+    output wire       fifo_pop,
+    // Interrupt output
+    output wire       irq
+);
+
+    // Register address map
+    localparam [3:0] ADDR_TMR_CTRL   = 4'h0,
+                     ADDR_TMR_PRESC  = 4'h1,
+                     ADDR_TMR_LOAD   = 4'h2,
+                     ADDR_TMR_CMP    = 4'h3,
+                     ADDR_TMR_CNT    = 4'h4,
+                     ADDR_ADC_CTRL   = 4'h5,
+                     ADDR_ADC_SMP    = 4'h6,
+                     ADDR_ADC_DIV    = 4'h7,
+                     ADDR_ADC_THR_LO = 4'h8,
+                     ADDR_ADC_THR_HI = 4'h9,
+                     ADDR_ADC_DATA   = 4'hA,
+                     ADDR_ADC_RCH    = 4'hB,
+                     ADDR_ADC_STAT   = 4'hC,
+                     ADDR_IRQ_EN     = 4'hD,
+                     ADDR_IRQ_STAT   = 4'hE,
+                     ADDR_ID         = 4'hF;
+
+    reg [7:0] adc_thr_lo;
+    reg [7:0] adc_thr_hi;
+    reg [5:0] irq_en;
+    reg [5:0] irq_stat;
+
+    assign pready  = 1'b1;
+    assign pslverr = 1'b0;
+
+    wire bus_wr = psel && penable &&  pwrite;
+    wire bus_rd = psel && penable && !pwrite;
+
+    // Pop FIFO on read access to ADC_DATA (0xA)
+    assign fifo_pop = bus_rd && (paddr == ADDR_ADC_DATA);
+
+    // Hardware event sources for IRQ_STAT
+    // NGUYEN VIET ANH - SE204450
+    wire sel_trig_pulse = (adc_trig_sel == 2'd0) ? adc_sw_start :
+                          (adc_trig_sel == 2'd1) ? tmr_ovf      :
+                          (adc_trig_sel == 2'd2) ? tmr_cmp_evt  : 1'b0;
+
+    wire evt_tmr_ovf   = tmr_ovf;
+    wire evt_tmr_cmp   = tmr_cmp_evt;
+    wire evt_adc_eoc   = adc_eoc;
+    wire evt_adc_wd    = adc_eoc && ((adc_result < adc_thr_lo) || (adc_result > adc_thr_hi));
+    wire evt_fifo_ovr  = adc_eoc && fifo_full;
+    wire evt_trig_miss = adc_en && adc_busy && sel_trig_pulse;
+
+    wire [5:0] hw_events = {
+        evt_trig_miss, // [5] TRIG_MISS
+        evt_fifo_ovr,  // [4] FIFO_OVR
+        evt_adc_wd,    // [3] ADC_WD
+        evt_adc_eoc,   // [2] ADC_EOC
+        evt_tmr_cmp,   // [1] TMR_CMP
+        evt_tmr_ovf    // [0] TMR_OVF
+    };
+
+    wire [5:0] w1c_mask = (bus_wr && (paddr == ADDR_IRQ_STAT)) ? pwdata[5:0] : 6'd0;
+
+    // Synchronous register writes and hardware flag updates
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tmr_en       <= 1'b0;
+            tmr_oneshot  <= 1'b0;
+            tmr_presc    <= 8'h00;
+            tmr_load     <= 8'hFF;
+            tmr_cmp      <= 8'h80;
+            adc_en       <= 1'b0;
+            adc_sw_start <= 1'b0;
+            adc_trig_sel <= 2'd0;
+            adc_ch       <= 2'd0;
+            adc_smp      <= 8'h04;
+            adc_div      <= 8'h00;
+            adc_thr_lo   <= 8'h00;
+            adc_thr_hi   <= 8'hFF;
+            irq_en       <= 6'h00;
+            irq_stat     <= 6'h00;
+        end else begin
+            // START is a self-clearing 1-clock pulse
+            adc_sw_start <= 1'b0;
+
+            // One-shot mode hardware auto-clear of TMR_CTRL.EN on overflow
+            if (tmr_ovf && tmr_oneshot) begin
+                tmr_en <= 1'b0;
+            end
+
+            if (bus_wr) begin
+                case (paddr)
+                    ADDR_TMR_CTRL: begin
+                        tmr_en      <= pwdata[0];
+                        tmr_oneshot <= pwdata[1];
+                    end
+                    ADDR_TMR_PRESC:  tmr_presc  <= pwdata;
+                    ADDR_TMR_LOAD:   tmr_load   <= pwdata;
+                    ADDR_TMR_CMP:    tmr_cmp    <= pwdata;
+                    ADDR_ADC_CTRL: begin
+                        adc_en       <= pwdata[0];
+                        adc_sw_start <= pwdata[1] && pwdata[0];
+                        adc_trig_sel <= pwdata[3:2];
+                        adc_ch       <= pwdata[5:4];
+                    end
+                    ADDR_ADC_SMP:    adc_smp    <= pwdata;
+                    ADDR_ADC_DIV:    adc_div    <= pwdata;
+                    ADDR_ADC_THR_LO: adc_thr_lo <= pwdata;
+                    ADDR_ADC_THR_HI: adc_thr_hi <= pwdata;
+                    ADDR_IRQ_EN:     irq_en     <= pwdata[5:0];
+                    default: ;
+                endcase
+            end
+
+            // Hardware set wins over a same-cycle CPU W1C clear
+            irq_stat <= (irq_stat & ~w1c_mask) | hw_events;
+        end
+    end
+
+    // Combinational read mux (0 when not selected)
+    always @(*) begin
+        if (psel && !pwrite) begin
+            case (paddr)
+                ADDR_TMR_CTRL:   prdata = {6'd0, tmr_oneshot, tmr_en};
+                ADDR_TMR_PRESC:  prdata = tmr_presc;
+                ADDR_TMR_LOAD:   prdata = tmr_load;
+                ADDR_TMR_CMP:    prdata = tmr_cmp;
+                ADDR_TMR_CNT:    prdata = tmr_cnt;
+                ADDR_ADC_CTRL:   prdata = {2'd0, adc_ch, adc_trig_sel, 1'b0, adc_en};
+                ADDR_ADC_SMP:    prdata = adc_smp;
+                ADDR_ADC_DIV:    prdata = adc_div;
+                ADDR_ADC_THR_LO: prdata = adc_thr_lo;
+                ADDR_ADC_THR_HI: prdata = adc_thr_hi;
+                ADDR_ADC_DATA:   prdata = fifo_empty ? 8'h00 : fifo_data;
+                ADDR_ADC_RCH:    prdata = fifo_empty ? 8'h00 : {1'b1, 5'd0, fifo_ch};
+                ADDR_ADC_STAT:   prdata = {1'b0, adc_busy, fifo_full, fifo_empty, fifo_level};
+                ADDR_IRQ_EN:     prdata = {2'd0, irq_en};
+                ADDR_IRQ_STAT:   prdata = {2'd0, irq_stat};
+                ADDR_ID:         prdata = 8'hA8;
+                default:         prdata = 8'h00;
+            endcase
+        end else begin
+            prdata = 8'h00;
+        end
+    end
+
+    assign irq = |(irq_stat & irq_en);
+
+endmodule
+
+---TIMER---
+`timescale 1ns / 1ps
+
+module timer8 (
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire       en,
+    input  wire       oneshot,
+    input  wire [7:0] presc,
+    input  wire [7:0] load,
+    input  wire [7:0] cmp,
+    output reg  [7:0] cnt,
+    output reg        ovf_pulse,
+    output reg        cmp_pulse,
+    output wire       pwm_out
+);
+
+    reg [7:0] presc_cnt;
+
+    // Prescaler tick: fires every (presc + 1) clocks while enabled.
+    // In one-shot mode, suppress ticking on the cycle ovf_pulse is high
+    // while the register block clears EN.
+    wire active = en && !(oneshot && ovf_pulse);
+    wire tick   = active && (presc_cnt >= presc);
+
+    assign pwm_out = active ? (cnt < cmp) : 1'b0;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            presc_cnt <= 8'd0;
+            cnt       <= 8'd0;
+            ovf_pulse <= 1'b0;
+            cmp_pulse <= 1'b0;
+        end else begin
+            ovf_pulse <= 1'b0;
+            cmp_pulse <= 1'b0;
+
+            if (!active) begin
+                presc_cnt <= 8'd0;
+                cnt       <= 8'd0;
+            end else begin
+                if (tick) begin
+                    presc_cnt <= 8'd0;
+
+                    if (cnt == cmp) begin
+                        cmp_pulse <= 1'b1;
+                    end
+
+                    if (cnt >= load) begin
+                        cnt       <= 8'd0;
+                        ovf_pulse <= 1'b1;
+                    end else begin
+                        cnt       <= cnt + 8'd1;
+                    end
+                end else begin
+                    presc_cnt <= presc_cnt + 8'd1;
+                end
+            end
+        end
+    end
+
+endmodule
+
+---SAR CONTROLLER---
+`timescale 1ns / 1ps
+
+module sar_adc_ctrl #(
+    parameter integer N = 8
+)(
+    input  wire           clk,
+    input  wire           rst_n,
+    input  wire           en,
+    input  wire           start_trig,
+    input  wire           cont_mode,
+    input  wire [1:0]     ch_sel,
+    input  wire [7:0]     smp,
+    input  wire [7:0]     div,
+    output reg            busy,
+    output reg            eoc,
+    output reg  [N-1:0]   result,
+    output reg  [1:0]     result_ch,
+    // Analog Front-End (AFE) interface
+    output reg            adc_sample,
+    output reg  [1:0]     adc_ch,
+    output reg  [N-1:0]   adc_dac,
+    input  wire           adc_cmp
+);
+
+    localparam [1:0] S_IDLE    = 2'd0,
+                     S_SAMPLE  = 2'd1,
+                     S_CONVERT = 2'd2,
+                     S_DONE    = 2'd3;
+
+    reg [1:0] state;
+    reg [7:0] div_cnt;
+    reg [7:0] smp_cnt;
+    reg [2:0] bit_idx;
+
+    wire adc_tick = (div_cnt >= div);
+
+    // Next DAC value resolved during CONVERT
+    reg [N-1:0] next_dac;
+    always @(*) begin
+        next_dac          = adc_dac;
+        next_dac[bit_idx] = adc_cmp;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state      <= S_IDLE;
+            div_cnt    <= 8'd0;
+            smp_cnt    <= 8'd0;
+            bit_idx    <= 3'd0;
+            busy       <= 1'b0;
+            eoc        <= 1'b0;
+            result     <= {N{1'b0}};
+            result_ch  <= 2'd0;
+            adc_sample <= 1'b0;
+            adc_ch     <= 2'd0;
+            adc_dac    <= {N{1'b0}};
+        end else if (!en) begin
+            // Clearing ADC_CTRL.EN aborts conversion immediately
+            state      <= S_IDLE;
+            div_cnt    <= 8'd0;
+            smp_cnt    <= 8'd0;
+            bit_idx    <= 3'd0;
+            busy       <= 1'b0;
+            eoc        <= 1'b0;
+            adc_sample <= 1'b0;
+            adc_dac    <= {N{1'b0}};
+        end else begin
+            eoc <= 1'b0;
+
+            case (state)
+                S_IDLE: begin
+                    busy       <= 1'b0;
+                    adc_sample <= 1'b0;
+                    adc_dac    <= {N{1'b0}};
+                    if (start_trig || cont_mode) begin
+                        state      <= S_SAMPLE;
+                        busy       <= 1'b1;
+                        adc_sample <= 1'b1;
+                        adc_ch     <= ch_sel;
+                        div_cnt    <= 8'd0;
+                        smp_cnt    <= 8'd0;
+                    end
+                end
+
+                S_SAMPLE: begin
+                    busy       <= 1'b1;
+                    adc_sample <= 1'b1;
+                    if (adc_tick) begin
+                        div_cnt <= 8'd0;
+                        if (smp_cnt >= smp) begin
+                            state      <= S_CONVERT;
+                            adc_sample <= 1'b0;
+                            bit_idx    <= N[2:0] - 3'd1;
+                            adc_dac    <= (1'b1 << (N - 1));
+                        end else begin
+                            smp_cnt <= smp_cnt + 8'd1;
+                        end
+                    end else begin
+                        div_cnt <= div_cnt + 8'd1;
+                    end
+                end
+
+                S_CONVERT: begin
+                    busy       <= 1'b1;
+                    adc_sample <= 1'b0;
+                    if (adc_tick) begin
+                        div_cnt <= 8'd0;
+                        if (bit_idx == 3'd0) begin
+                            state     <= S_DONE;
+                            busy      <= 1'b0;
+                            eoc       <= 1'b1;
+                            result    <= next_dac;
+                            result_ch <= adc_ch;
+                            adc_dac   <= {N{1'b0}};
+                        end else begin
+                            adc_dac <= next_dac | (1'b1 << (bit_idx - 3'd1));
+                            bit_idx <= bit_idx - 3'd1;
+                        end
+                    end else begin
+                        div_cnt <= div_cnt + 8'd1;
+                    end
+                end
+
+                S_DONE: begin
+                    if (cont_mode || start_trig) begin
+                        state      <= S_SAMPLE;
+                        busy       <= 1'b1;
+                        adc_sample <= 1'b1;
+                        adc_ch     <= ch_sel;
+                        div_cnt    <= 8'd0;
+                        smp_cnt    <= 8'd0;
+                    end else begin
+                        state      <= S_IDLE;
+                        busy       <= 1'b0;
+                        adc_sample <= 1'b0;
+                    end
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+
+endmodule
+
+---FIFO SYNC---
+`timescale 1ns / 1ps
+
+module sync_fifo #(
+    parameter integer WIDTH  = 10,
+    parameter integer DEPTH  = 8,
+    parameter integer ADDR_W = 3
+)(
+    input  wire              clk,
+    input  wire              rst_n,
+    input  wire              push,
+    input  wire [WIDTH-1:0]  din,
+    input  wire              pop,
+    output wire [WIDTH-1:0]  dout,
+    output wire              full,
+    output wire              empty,
+    output reg  [ADDR_W:0]   level
+);
+
+    reg [WIDTH-1:0]  mem [0:DEPTH-1];
+    reg [ADDR_W-1:0] wr_ptr;
+    reg [ADDR_W-1:0] rd_ptr;
+
+    assign full  = (level == DEPTH[ADDR_W:0]);
+    assign empty = (level == {(ADDR_W+1){1'b0}});
+
+    // Drop new results if FIFO is already full
+    wire do_push = push && !full;
+    wire do_pop  = pop  && !empty;
+
+    // Show-ahead read so ADC_RCH and ADC_DATA are valid combinationally
+    assign dout  = empty ? {WIDTH{1'b0}} : mem[rd_ptr];
+
+    integer i;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wr_ptr <= {ADDR_W{1'b0}};
+            rd_ptr <= {ADDR_W{1'b0}};
+            level  <= {(ADDR_W+1){1'b0}};
+            for (i = 0; i < DEPTH; i = i + 1) begin
+                mem[i] <= {WIDTH{1'b0}};
+            end
+        end else begin
+            if (do_push) begin
+                mem[wr_ptr] <= din;
+                wr_ptr      <= wr_ptr + 1'b1;
+            end
+
+            if (do_pop) begin
+                rd_ptr <= rd_ptr + 1'b1;
+            end
+
+            case ({do_push, do_pop})
+                2'b10:   level <= level + 1'b1;
+                2'b01:   level <= level - 1'b1;
+                default: level <= level;
+            endcase
+        end
+    end
+
+endmodule
