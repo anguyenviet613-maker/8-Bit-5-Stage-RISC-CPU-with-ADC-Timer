@@ -1,7 +1,7 @@
 NGUYEN VIET ANH - SE204450
 
 # 8-Bit-5-Stage-RISC-CPU-with-ADC-Timer
-An 8-bit System-on-Chip (SoC) featuring a custom 5-stage pipelined RISC CPU integrated with a Timer and SAR ADC controller via an Advanced Peripheral Bus (APB) interface. Developed in Verilog and verified using a Universal Verification Methodology (UVM) testbench in SystemVerilog. The system uses custom assembly firmware (`soc_demo.s`) compiled into machine code to verify.
+An 8-bit System-on-Chip (SoC) featuring a custom 5-stage pipelined RISC CPU integrated with a Timer and SAR ADC controller via an Advanced Peripheral Bus (APB) interface. This project was coded in Verilog and verified using a Universal Verification Methodology (UVM) testbench in SystemVerilog. The system uses custom assembly firmware (`soc_demo.s`) compiled into machine code to verify.
 
 How to Run
 1. Clone the repository and open Vivado.
